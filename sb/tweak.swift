@@ -58,7 +58,7 @@ func _showSafeModeAlert() {
         
         let exitAction = UIAlertAction(title: "Exit Safe Mode", style: .default, handler: { action in
             alert = nil
-            try? FileManager.default.removeItem(atPath: "/var/mobile/.eksafemode")
+            try? FileManager.default.removeItem(atPath: "\(safeModeFlagPath)")
             exit(0)
         })
 
@@ -170,36 +170,95 @@ let exitSafeModeSignals = [
     SIGTERM
 ]
 
-func trap(signals: [Int32], action: (@convention(c) (Int32) -> Void)?) {
+let safeModeFlagPath: StaticString = "/var/mobile/.eksafemode"
+
+private extension StaticString {
+    var cString: UnsafePointer<CChar> {
+        UnsafeRawPointer(utf8Start).assumingMemoryBound(to: CChar.self)
+    }
+}
+
+var crashSignalMask = sigset_t()
+var exitSafeModeSignalMask = sigset_t()
+
+func trap(signals: [Int32], action: @escaping @convention(c) (Int32) -> Void) -> sigset_t {
     var signalAction = sigaction()
     signalAction.__sigaction_u.__sa_handler = action
+    signalAction.sa_flags = SA_NODEFER | SA_RESETHAND // a nested fault must kill us, not spin on a blocked SIGTRAP
+    sigemptyset(&signalAction.sa_mask)
 
-    signals.forEach { sig in
-        signal(sig, action)
+    var mask = sigset_t()
+    for sig in signals {
+        sigaction(sig, &signalAction, nil)
+        mask |= sigset_t(1) << sigset_t(sig - 1)
     }
+    return mask
 }
 
-func handleExitSafeModeRequest(currentSig: Int32) {
-    try? FileManager.default.removeItem(atPath: "/var/mobile/.eksafemode")
-    exitSafeModeSignals.forEach {
-        signal($0, SIG_DFL)
-    }
-    raise(currentSig)
-}
-
-func enterSafeMode(_ reason: String) {
+func enterSafeMode(_ reason: String, at time: Date = Date()) {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss xxx"
     formatter.timeZone = TimeZone.current
-    let date = formatter.string(from: Date())
-    FileManager.default.createFile(atPath: "/var/mobile/.eksafemode", contents: "[\(date)] \(reason)".data(using: .utf8))
+    let date = formatter.string(from: time)
+    FileManager.default.createFile(atPath: "\(safeModeFlagPath)", contents: "[\(date)] \(reason)".data(using: .utf8))
 }
 
-func handleSBCrash(currentSig: Int32) {
-    enterSafeMode("SB crash occured: signal \(currentSig)")
-    crashSignals.forEach {
-        signal($0, SIG_DFL)
+func finishSafeModeReason() {
+    guard let raw = try? String(contentsOfFile: "\(safeModeFlagPath)", encoding: .utf8),
+          raw.hasPrefix("@"),
+          let space = raw.firstIndex(of: " "),
+          let time = TimeInterval(raw[raw.index(after: raw.startIndex)..<space]) else { return }
+    enterSafeMode(String(raw[raw.index(after: space)...]), at: Date(timeIntervalSince1970: time))
+}
+
+// Signal handlers: async-signal-safe calls only, they may run with libobjc/malloc locks held
+
+private func resetToDefault(_ mask: sigset_t) {
+    var sig: Int32 = 1
+    while sig < NSIG {
+        if mask & (sigset_t(1) << sigset_t(sig - 1)) != 0 {
+            signal(sig, SIG_DFL)
+        }
+        sig += 1
     }
+}
+
+private func writeStatic(_ fd: Int32, _ string: StaticString) {
+    _ = write(fd, string.utf8Start, string.utf8CodeUnitCount)
+}
+
+private func writeDecimal(_ fd: Int32, _ value: UInt64) {
+    var divisor: UInt64 = 1
+    while value / divisor >= 10 {
+        divisor *= 10
+    }
+    repeat {
+        var digit = 0x30 /* "0" */ + UInt8(truncatingIfNeeded: value / divisor % 10)
+        _ = write(fd, &digit, 1)
+        divisor /= 10
+    } while divisor > 0
+}
+
+func handleExitSafeModeRequest(currentSig: Int32) {
+    resetToDefault(exitSafeModeSignalMask)
+    unlink(safeModeFlagPath.cString)
+    raise(currentSig)
+}
+
+// The date can't be formatted here, so leave "@<unix time> <reason>" for finishSafeModeReason()
+func handleSBCrash(currentSig: Int32) {
+    resetToDefault(crashSignalMask)
+
+    let fd = open(safeModeFlagPath.cString, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if fd >= 0 {
+        let now = time(nil)
+        writeStatic(fd, "@")
+        writeDecimal(fd, now > 0 ? UInt64(now) : 0)
+        writeStatic(fd, " SB crash occured: signal ")
+        writeDecimal(fd, UInt64(UInt32(bitPattern: currentSig)))
+        close(fd)
+    }
+
     raise(currentSig)
 }
 
@@ -208,7 +267,8 @@ public func tweak_entry() {
         
     NSLog("Hello world, SpringBoard!")
                 
-    if FileManager.default.fileExists(atPath: "/var/mobile/.eksafemode") {
+    if FileManager.default.fileExists(atPath: "\(safeModeFlagPath)") {
+        finishSafeModeReason()
         performHooks()
     } else if checkVolumeUp() {
         tprint("Volume up!!!")
@@ -216,6 +276,6 @@ public func tweak_entry() {
         exit(0)
     }
         
-    trap(signals: exitSafeModeSignals, action: handleExitSafeModeRequest)
-    trap(signals: crashSignals, action: handleSBCrash)
+    exitSafeModeSignalMask = trap(signals: exitSafeModeSignals, action: handleExitSafeModeRequest)
+    crashSignalMask = trap(signals: crashSignals, action: handleSBCrash)
 }
